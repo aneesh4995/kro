@@ -89,6 +89,7 @@ func (r *ResourceGraphDefinitionReconciler) setResourceGraphDefinitionStatus(
 	resourcegraphdefinition *v1alpha1.ResourceGraphDefinition,
 	topologicalOrder []string,
 	resources []v1alpha1.ResourceInformation,
+	celCostMetrics *v1alpha1.CELCostMetrics, // New parameter
 	reconcileErr error,
 ) error {
 	log, _ := logr.FromContext(ctx)
@@ -131,6 +132,7 @@ func (r *ResourceGraphDefinitionReconciler) setResourceGraphDefinitionStatus(
 		dc.Status.State = processor.state
 		dc.Status.TopologicalOrder = topologicalOrder
 		dc.Status.Resources = resources
+		dc.Status.CELMetrics = celCostMetrics // New line: Assign collected metrics
 
 		log.V(1).Info("updating resource graph definition status",
 			"state", dc.Status.State,

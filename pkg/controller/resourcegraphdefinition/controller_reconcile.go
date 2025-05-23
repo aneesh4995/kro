@@ -28,26 +28,53 @@ import (
 	"github.com/kro-run/kro/pkg/dynamiccontroller"
 	"github.com/kro-run/kro/pkg/graph"
 	"github.com/kro-run/kro/pkg/metadata"
+	kroruntime "github.com/kro-run/kro/pkg/runtime" // Added import for runtime
 )
 
 // reconcileResourceGraphDefinition orchestrates the reconciliation of a ResourceGraphDefinition by:
 // 1. Processing the resource graph
 // 2. Ensuring CRDs are present
 // 3. Setting up and starting the microcontroller
-func (r *ResourceGraphDefinitionReconciler) reconcileResourceGraphDefinition(ctx context.Context, rgd *v1alpha1.ResourceGraphDefinition) ([]string, []v1alpha1.ResourceInformation, error) {
+func (r *ResourceGraphDefinitionReconciler) reconcileResourceGraphDefinition(ctx context.Context, rgd *v1alpha1.ResourceGraphDefinition) ([]string, []v1alpha1.ResourceInformation, *v1alpha1.CELCostMetrics, error) {
 	log := ctrl.LoggerFrom(ctx)
 
 	// Process resource graph definition graph first to validate structure
 	log.V(1).Info("reconciling resource graph definition graph")
 	processedRGD, resourcesInfo, err := r.reconcileResourceGraphDefinitionGraph(ctx, rgd)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	rt, err := kroruntime.NewResourceGraphDefinitionRuntime(processedRGD.Instance, processedRGD.Resources, processedRGD.TopologicalOrder, r.trackCELCosts) // Use r.trackCELCosts
+	if err != nil {
+		// Handle error - this could be a new error type or part of reconcileErr
+		return processedRGD.TopologicalOrder, resourcesInfo, nil, fmt.Errorf("failed to create RGD runtime: %w", err)
+	}
+	// Loop to synchronize and resolve. This is typically done by the instance controller,
+	// but for RGD status, we might need a simplified version if costs depend on resolved values.
+	// For now, let's assume initial costs (static, includeWhen/readyWhen if they don't depend on live data) are available.
+	// A full sync loop could be:
+	// for {
+	//     done, syncErr := rt.Synchronize()
+	//     if syncErr != nil {
+	//         return processedRGD.TopologicalOrder, resourcesInfo, nil, fmt.Errorf("runtime synchronization error: %w", syncErr)
+	//     }
+	//     if !done { // if done is true, it means continue, if false, it means break.
+	//         break
+	//     }
+	// }
+
+	// Aggregate CEL costs
+	celCostMetrics, costErr := rt.AggregateCELCosts()
+	if costErr != nil {
+		// Log the error but don't necessarily fail the whole reconciliation
+		log.Error(costErr, "failed to aggregate CEL costs")
 	}
 
 	// Setup metadata labeling
 	graphExecLabeler, err := r.setupLabeler(rgd)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to setup labeler: %w", err)
+		return nil, nil, celCostMetrics, fmt.Errorf("failed to setup labeler: %w", err)
 	}
 
 	crd := processedRGD.Instance.GetCRD()
@@ -56,7 +83,7 @@ func (r *ResourceGraphDefinitionReconciler) reconcileResourceGraphDefinition(ctx
 	// Ensure CRD exists and is up to date
 	log.V(1).Info("reconciling resource graph definition CRD")
 	if err := r.reconcileResourceGraphDefinitionCRD(ctx, crd); err != nil {
-		return processedRGD.TopologicalOrder, resourcesInfo, err
+		return processedRGD.TopologicalOrder, resourcesInfo, celCostMetrics, err
 	}
 
 	// Setup and start microcontroller
@@ -68,10 +95,10 @@ func (r *ResourceGraphDefinitionReconciler) reconcileResourceGraphDefinition(ctx
 	// a new context with our own cancel function here to allow us to cleanly term the dynamic controller
 	// rather than have it ignore this context and use the background context.
 	if err := r.reconcileResourceGraphDefinitionMicroController(ctx, &gvr, controller.Reconcile); err != nil {
-		return processedRGD.TopologicalOrder, resourcesInfo, err
+		return processedRGD.TopologicalOrder, resourcesInfo, celCostMetrics, err
 	}
 
-	return processedRGD.TopologicalOrder, resourcesInfo, nil
+	return processedRGD.TopologicalOrder, resourcesInfo, celCostMetrics, nil
 }
 
 // setupLabeler creates and merges the required labelers for the resource graph definition

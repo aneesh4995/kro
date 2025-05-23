@@ -154,6 +154,25 @@ type ResourceGraphDefinitionStatus struct {
 	Conditions []Condition `json:"conditions,omitempty"`
 	// Resources represents the resources, and their information (dependencies for now)
 	Resources []ResourceInformation `json:"resources,omitempty"`
+	// CELMetrics contains the cost metrics for CEL expression evaluations.
+	// +optional
+	CELMetrics *CELCostMetrics `json:"celMetrics,omitempty"`
+}
+
+// CELCostMetrics defines the observed cost of CEL expression evaluations.
+type CELCostMetrics struct {
+	// TotalCost is the estimated total cost of all CEL expressions evaluated.
+	// +optional
+	TotalCost *int64 `json:"totalCost,omitempty"`
+
+	// CostPerResource provides a breakdown of CEL evaluation costs per resource ID
+	// within the ResourceGraphDefinition. This can also include costs for
+	// expressions not directly tied to a specific resource (e.g., global validations,
+	// includeWhen/readyWhen conditions evaluated before resource context is fully known).
+	// Keys might be resource IDs or special identifiers like "_static", "_instance_status",
+	// "_includeWhen", "_readyWhen".
+	// +optional
+	CostPerResource map[string]int64 `json:"costPerResource,omitempty"`
 }
 
 // ResourceInformation defines the information about a resource

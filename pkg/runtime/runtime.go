@@ -23,10 +23,23 @@ import (
 	"golang.org/x/exp/maps"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 
-	krocel "github.com/kro-run/kro/pkg/cel"
+	krocelapi "github.com/kro-run/kro/api/v1alpha1" // For v1alpha1.CELCostMetrics
+	celhelpers "github.com/kro-run/kro/pkg/cel"     // Alias for pkg/cel for environment functions
 	"github.com/kro-run/kro/pkg/graph/variable"
 	"github.com/kro-run/kro/pkg/runtime/resolver"
 )
+
+// expressionEvaluationState holds the state of an expression evaluation.
+// This is used to cache the results of expressions and avoid re-evaluating
+// them unnecessarily.
+type expressionEvaluationState struct {
+	Expression    string
+	Dependencies  []string
+	Kind          variable.VariableKind
+	Resolved      bool
+	ResolvedValue interface{}
+	Cost          int64 // New field
+}
 
 // Compile time proof to ensure that ResourceGraphDefinitionRuntime implements the
 // Runtime interface.
@@ -46,6 +59,7 @@ func NewResourceGraphDefinitionRuntime(
 	instance Resource,
 	resources map[string]Resource,
 	topologicalOrder []string,
+	trackCost bool, // New parameter
 ) (*ResourceGraphDefinitionRuntime, error) {
 	r := &ResourceGraphDefinitionRuntime{
 		instance:                     instance,
@@ -55,6 +69,7 @@ func NewResourceGraphDefinitionRuntime(
 		runtimeVariables:             make(map[string][]*expressionEvaluationState),
 		expressionsCache:             make(map[string]*expressionEvaluationState),
 		ignoredByConditionsResources: make(map[string]bool),
+		trackCost:                    trackCost, // Use the parameter
 	}
 	// make sure to copy the variables and the dependencies, to avoid
 	// modifying the original resource.
@@ -170,6 +185,8 @@ type ResourceGraphDefinitionRuntime struct {
 	// ignoredByConditionsResources holds the resources who's defined conditions returned false
 	// or who's dependencies are ignored
 	ignoredByConditionsResources map[string]bool
+	// trackCost enables the tracking of CEL evaluation costs.
+	trackCost bool // New field
 }
 
 // TopologicalOrder returns the topological order of resources.
@@ -306,7 +323,11 @@ func (rt *ResourceGraphDefinitionRuntime) resourceVariablesResolved(resource str
 // depending only on the initial configuration. This function is usually
 // called once during runtime initialization to set up the baseline state
 func (rt *ResourceGraphDefinitionRuntime) evaluateStaticVariables() error {
-	env, err := krocel.DefaultEnvironment(krocel.WithResourceIDs([]string{"schema"}))
+	envOpts := []celhelpers.EnvOption{celhelpers.WithResourceIDs([]string{"schema"})}
+	if rt.trackCost {
+		envOpts = append(envOpts, celhelpers.WithCostTracking())
+	}
+	env, _, err := celhelpers.DefaultEnvironment(envOpts...)
 	if err != nil {
 		return err
 	}
@@ -314,15 +335,16 @@ func (rt *ResourceGraphDefinitionRuntime) evaluateStaticVariables() error {
 	evalContext := map[string]interface{}{
 		"schema": rt.instance.Unstructured().Object,
 	}
-	for _, variable := range rt.expressionsCache {
-		if variable.Kind.IsStatic() {
-			value, err := evaluateExpression(env, evalContext, variable.Expression)
+	for _, exprState := range rt.expressionsCache { // Renamed for clarity
+		if exprState.Kind.IsStatic() {
+			value, cost, err := evaluateExpression(env, evalContext, exprState.Expression, rt.trackCost)
 			if err != nil {
 				return err
 			}
 
-			variable.Resolved = true
-			variable.ResolvedValue = value
+			exprState.Resolved = true
+			exprState.ResolvedValue = value
+			exprState.Cost = cost
 		}
 	}
 	return nil
@@ -351,7 +373,11 @@ func (rt *ResourceGraphDefinitionRuntime) evaluateDynamicVariables() error {
 
 	resolvedResources := maps.Keys(rt.resolvedResources)
 	resolvedResources = append(resolvedResources, "schema")
-	env, err := krocel.DefaultEnvironment(krocel.WithResourceIDs(resolvedResources))
+	envOpts := []celhelpers.EnvOption{celhelpers.WithResourceIDs(resolvedResources)}
+	if rt.trackCost {
+		envOpts = append(envOpts, celhelpers.WithCostTracking())
+	}
+	env, _, err := celhelpers.DefaultEnvironment(envOpts...)
 	if err != nil {
 		return err
 	}
@@ -360,28 +386,28 @@ func (rt *ResourceGraphDefinitionRuntime) evaluateDynamicVariables() error {
 	// the dynamic variables that depend on it.
 	// Since we have already cached the expressions, we don't need to
 	// loop over all the resources.
-	for _, variable := range rt.expressionsCache {
-		if variable.Kind.IsDynamic() {
+	for _, exprState := range rt.expressionsCache { // Renamed for clarity
+		if exprState.Kind.IsDynamic() {
 			// Skip the variable if it's already resolved
-			if variable.Resolved {
+			if exprState.Resolved {
 				continue
 			}
 
 			// we need to make sure that the dependencies are
 			// part of the resolved resources.
-			if len(variable.Dependencies) > 0 &&
-				!containsAllElements(resolvedResources, variable.Dependencies) {
+			if len(exprState.Dependencies) > 0 &&
+				!containsAllElements(resolvedResources, exprState.Dependencies) {
 				continue
 			}
 
 			evalContext := make(map[string]interface{})
-			for _, dep := range variable.Dependencies {
+			for _, dep := range exprState.Dependencies {
 				evalContext[dep] = rt.resolvedResources[dep].Object
 			}
 
 			evalContext["schema"] = rt.instance.Unstructured().Object
 
-			value, err := evaluateExpression(env, evalContext, variable.Expression)
+			value, cost, err := evaluateExpression(env, evalContext, exprState.Expression, rt.trackCost)
 			if err != nil {
 				if strings.Contains(err.Error(), "no such key") {
 					// TODO(a-hilaly): I'm not sure if this is the best way to handle
@@ -396,8 +422,9 @@ func (rt *ResourceGraphDefinitionRuntime) evaluateDynamicVariables() error {
 				}
 			}
 
-			variable.Resolved = true
-			variable.ResolvedValue = value
+			exprState.Resolved = true
+			exprState.ResolvedValue = value
+			exprState.Cost = cost
 		}
 	}
 
@@ -485,7 +512,11 @@ func (rt *ResourceGraphDefinitionRuntime) IsResourceReady(resourceID string) (bo
 
 	// we should not expect errors here since we already compiled it
 	// in the dryRun
-	env, err := krocel.DefaultEnvironment(krocel.WithResourceIDs([]string{resourceID}))
+	envOpts := []celhelpers.EnvOption{celhelpers.WithResourceIDs([]string{resourceID})}
+	if rt.trackCost {
+		envOpts = append(envOpts, celhelpers.WithCostTracking())
+	}
+	env, _, err := celhelpers.DefaultEnvironment(envOpts...)
 	if err != nil {
 		return false, "", fmt.Errorf("failed creating new Environment: %w", err)
 	}
@@ -494,7 +525,8 @@ func (rt *ResourceGraphDefinitionRuntime) IsResourceReady(resourceID string) (bo
 	}
 
 	for _, expression := range expressions {
-		out, err := evaluateExpression(env, context, expression)
+		// Cost from ReadyWhen is not stored in expressionEvaluationState here, will be aggregated later if needed.
+		out, _, err := evaluateExpression(env, context, expression, rt.trackCost)
 		if err != nil {
 			return false, "", fmt.Errorf("failed evaluating expressison %s: %w", expression, err)
 		}
@@ -541,7 +573,11 @@ func (rt *ResourceGraphDefinitionRuntime) ReadyToProcessResource(resourceID stri
 
 	// we should not expect errors here since we already compiled it
 	// in the dryRun
-	env, err := krocel.DefaultEnvironment(krocel.WithResourceIDs([]string{"schema"}))
+	envOpts := []celhelpers.EnvOption{celhelpers.WithResourceIDs([]string{"schema"})}
+	if rt.trackCost {
+		envOpts = append(envOpts, celhelpers.WithCostTracking())
+	}
+	env, _, err := celhelpers.DefaultEnvironment(envOpts...)
 	if err != nil {
 		return false, nil
 	}
@@ -552,7 +588,8 @@ func (rt *ResourceGraphDefinitionRuntime) ReadyToProcessResource(resourceID stri
 
 	for _, includeWhenExpression := range includeWhenExpressions {
 		// We should not expect an error here as well since we checked during dry-run
-		value, err := evaluateExpression(env, context, includeWhenExpression)
+		// Cost from IncludeWhen is not stored in expressionEvaluationState here.
+		value, _, err := evaluateExpression(env, context, includeWhenExpression, rt.trackCost)
 		if err != nil {
 			return false, err
 		}
@@ -565,25 +602,85 @@ func (rt *ResourceGraphDefinitionRuntime) ReadyToProcessResource(resourceID stri
 }
 
 // evaluateExpression evaluates an CEL expression and returns a value if successful, or error
-func evaluateExpression(env *cel.Env, context map[string]interface{}, expression string) (interface{}, error) {
+func evaluateExpression(env *cel.Env, context map[string]interface{}, expression string, trackCost bool) (interface{}, int64, error) {
 	ast, issues := env.Compile(expression)
 	if issues != nil && issues.Err() != nil {
-		return nil, fmt.Errorf("failed compiling expression %s: %w", expression, issues.Err())
-	}
-	// Here as well
-	program, err := env.Program(ast)
-	if err != nil {
-		return nil, fmt.Errorf("failed programming expression %s: %w", expression, err)
-	}
-	// We get an error here when the value field we're looking for is not yet defined
-	// For now leaving it as error, in the future when we see different scenarios
-	// of this error, we can make some a reason, and others an error
-	val, _, err := program.Eval(context)
-	if err != nil {
-		return nil, fmt.Errorf("failed evaluating expression %s: %w", expression, err)
+		return nil, 0, fmt.Errorf("failed compiling expression %s: %w", expression, issues.Err())
 	}
 
-	return krocel.GoNativeType(val)
+	var program cel.Program
+	var err error
+	if trackCost {
+		program, err = env.Program(ast, cel.EvalOptions(cel.OptTrackCost))
+	} else {
+		program, err = env.Program(ast)
+	}
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed programming expression %s: %w", expression, err)
+	}
+
+	val, details, err := program.Eval(context)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed evaluating expression %s: %w", expression, err)
+	}
+
+	var cost int64
+	if trackCost && details != nil {
+		celCost := details.Cost() // Cost() returns a pointer
+		if celCost != nil {
+			cost = celCost.Total()
+		}
+	}
+
+	nativeVal, nativeErr := celhelpers.GoNativeType(val) // Use celhelpers
+	return nativeVal, cost, nativeErr
+}
+
+// AggregateCELCosts aggregates all collected CEL evaluation costs.
+func (rt *ResourceGraphDefinitionRuntime) AggregateCELCosts() (*krocelapi.CELCostMetrics, error) {
+	if !rt.trackCost {
+		// Return nil or an empty struct if cost tracking is disabled
+		return nil, nil
+	}
+
+	overallTotalCost := int64(0)
+	costsAtResourceLevel := make(map[string]int64)
+
+	// Iterate over runtimeVariables which is map[string][]*expressionEvaluationState
+	// The key of runtimeVariables is the resourceID or "instance"
+	for resourceID, exprStates := range rt.runtimeVariables {
+		resourceTotalCost := int64(0)
+		for _, exprState := range exprStates {
+			// Ensure the expression was actually resolved and cost is available
+			if exprState.Resolved {
+				resourceTotalCost += exprState.Cost
+			}
+		}
+		if resourceTotalCost > 0 {
+			costsAtResourceLevel[resourceID] = resourceTotalCost
+		}
+		overallTotalCost += resourceTotalCost
+	}
+
+	// Placeholder: Costs from ReadyWhen and IncludeWhen expressions
+	// These are not yet fully captured in a way that easily flows into this aggregation.
+
+	// Only create the CELCostMetrics if there's something to report
+	if overallTotalCost == 0 && len(costsAtResourceLevel) == 0 {
+		return nil, nil
+	}
+
+	// Assign overallTotalCost to a pointer
+	var totalCostPtr *int64
+	if overallTotalCost > 0 {
+		val := overallTotalCost // Create a new variable for the pointer
+		totalCostPtr = &val
+	}
+
+	return &krocelapi.CELCostMetrics{
+		TotalCost:       totalCostPtr,
+		CostPerResource: costsAtResourceLevel,
+	}, nil
 }
 
 // containsAllElements checks if all elements in the inner slice are present

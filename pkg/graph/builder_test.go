@@ -18,9 +18,14 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"reflect"
+
+	"github.com/google/cel-go/cel"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"k8s.io/client-go/rest"
 
+	celhelpers "github.com/kro-run/kro/pkg/cel" // Updated import alias
 	"github.com/kro-run/kro/pkg/graph/emulator"
 	"github.com/kro-run/kro/pkg/graph/variable"
 	"github.com/kro-run/kro/pkg/testutil/generator"
@@ -30,10 +35,14 @@ import (
 
 func TestGraphBuilder_Validation(t *testing.T) {
 	fakeResolver, fakeDiscovery := k8s.NewFakeResolver()
+	// Initialize celEnvOpts for the builder, similar to NewBuilder
+	_, celEnvOpts, err := celhelpers.DefaultEnvironment()
+	require.NoError(t, err, "Failed to create default CEL environment options for builder test")
 	builder := &Builder{
 		schemaResolver:   fakeResolver,
 		discoveryClient:  fakeDiscovery,
 		resourceEmulator: emulator.NewEmulator(),
+		celEnvOpts:       celEnvOpts,
 	}
 
 	tests := []struct {
@@ -440,10 +449,13 @@ func TestGraphBuilder_Validation(t *testing.T) {
 
 func TestGraphBuilder_DependencyValidation(t *testing.T) {
 	fakeResolver, fakeDiscovery := k8s.NewFakeResolver()
+	_, celEnvOpts, err := celhelpers.DefaultEnvironment()
+	require.NoError(t, err, "Failed to create default CEL environment options for builder test")
 	builder := &Builder{
 		schemaResolver:   fakeResolver,
 		discoveryClient:  fakeDiscovery,
 		resourceEmulator: emulator.NewEmulator(),
+		celEnvOpts:       celEnvOpts,
 	}
 
 	tests := []struct {
@@ -1000,10 +1012,13 @@ func TestGraphBuilder_DependencyValidation(t *testing.T) {
 
 func TestGraphBuilder_ExpressionParsing(t *testing.T) {
 	fakeResolver, fakeDiscovery := k8s.NewFakeResolver()
+	_, celEnvOpts, err := celhelpers.DefaultEnvironment()
+	require.NoError(t, err, "Failed to create default CEL environment options for builder test")
 	builder := &Builder{
 		schemaResolver:   fakeResolver,
 		discoveryClient:  fakeDiscovery,
 		resourceEmulator: emulator.NewEmulator(),
+		celEnvOpts:       celEnvOpts,
 	}
 
 	tests := []struct {
@@ -1352,14 +1367,97 @@ func TestNewBuilder(t *testing.T) {
 	builder, err := NewBuilder(&rest.Config{})
 	assert.Nil(t, err)
 	assert.NotNil(t, builder)
+	assert.NotNil(t, builder.celEnvOpts, "Builder's celEnvOpts should be initialized")
+}
+
+func TestDryRunExpression_TrackCost(t *testing.T) {
+	tests := []struct {
+		name       string
+		expression string
+		trackCost  bool
+		wantValue  interface{}
+		wantErr    bool
+	}{
+		{
+			name:       "simple math with cost tracking",
+			expression: "1 + 2",
+			trackCost:  true,
+			wantValue:  int64(3),
+			wantErr:    false,
+		},
+		{
+			name:       "simple math without cost tracking",
+			expression: "1 + 2",
+			trackCost:  false,
+			wantValue:  int64(3),
+			wantErr:    false,
+		},
+		{
+			name:       "string operation with cost tracking",
+			expression: "'abc'.size()",
+			trackCost:  true,
+			wantValue:  int64(3),
+			wantErr:    false,
+		},
+		{
+			name:       "string operation without cost tracking",
+			expression: "'abc'.size()",
+			trackCost:  false,
+			wantValue:  int64(3),
+			wantErr:    false,
+		},
+		{
+			name:       "invalid expression with cost tracking",
+			expression: "1 + ",
+			trackCost:  true,
+			wantErr:    true,
+		},
+		{
+			name:       "invalid expression without cost tracking",
+			expression: "1 + ",
+			trackCost:  false,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create a basic CEL environment for the test
+			// No specific resource IDs needed if the expression doesn't refer to them.
+			envOpts := []celhelpers.EnvOption{}
+			if tt.trackCost { // This specific env is for this test, not the builder's internal one
+				envOpts = append(envOpts, celhelpers.WithCostTracking())
+			}
+			env, _, err := celhelpers.DefaultEnvironment(envOpts...)
+			require.NoError(t, err, "Failed to create CEL environment for test")
+
+			// dryRunExpression context (resources map) can be empty if expression is self-contained
+			resources := make(map[string]*Resource)
+
+			gotValue, err := dryRunExpression(env, tt.expression, resources, tt.trackCost)
+
+			if tt.wantErr {
+				assert.Error(t, err, "Expected an error for expression: %s", tt.expression)
+			} else {
+				assert.NoError(t, err, "Did not expect an error for expression: %s", tt.expression)
+				// Convert cel-go value to native Go type for comparison
+				nativeValue, convErr := celhelpers.GoNativeType(gotValue)
+				assert.NoError(t, convErr, "Failed to convert CEL value to native type")
+				assert.Equal(t, tt.wantValue, nativeValue, "Expression evaluated to unexpected value")
+			}
+		})
+	}
 }
 
 func Test_ValidateOpenAPISchema(t *testing.T) {
 	fakeResolver, fakeDiscovery := k8s.NewFakeResolver()
+	_, celEnvOpts, err := celhelpers.DefaultEnvironment()
+	require.NoError(t, err, "Failed to create default CEL environment options for builder test")
 	builder := &Builder{
 		schemaResolver:   fakeResolver,
 		discoveryClient:  fakeDiscovery,
 		resourceEmulator: emulator.NewEmulator(),
+		celEnvOpts:       celEnvOpts,
 	}
 
 	tests := []struct {

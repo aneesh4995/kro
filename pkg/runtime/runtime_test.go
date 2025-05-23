@@ -24,9 +24,251 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
-	krocel "github.com/kro-run/kro/pkg/cel"
+	krocelapi "github.com/kro-run/kro/api/v1alpha1" // For v1alpha1.CELCostMetrics
+	celhelpers "github.com/kro-run/kro/pkg/cel"     // Alias for cel package
 	"github.com/kro-run/kro/pkg/graph/variable"
 )
+
+func TestEvaluateExpression_CostCalculation(t *testing.T) {
+	tests := []struct {
+		name            string
+		expression      string
+		context         map[string]interface{}
+		trackCost       bool
+		wantValue       interface{}
+		wantCostNonZero bool // True if cost should be > 0 when trackCost is true
+		wantErr         bool
+	}{
+		{
+			name:            "simple math with cost",
+			expression:      "1 + 2",
+			context:         map[string]interface{}{},
+			trackCost:       true,
+			wantValue:       int64(3),
+			wantCostNonZero: true,
+		},
+		{
+			name:            "simple math without cost",
+			expression:      "1 + 2",
+			context:         map[string]interface{}{},
+			trackCost:       false,
+			wantValue:       int64(3),
+			wantCostNonZero: false,
+		},
+		{
+			name:            "string size with cost",
+			expression:      "'hello'.size()",
+			context:         map[string]interface{}{},
+			trackCost:       true,
+			wantValue:       int64(5),
+			wantCostNonZero: true,
+		},
+		{
+			name:            "string size without cost",
+			expression:      "'hello'.size()",
+			context:         map[string]interface{}{},
+			trackCost:       false,
+			wantValue:       int64(5),
+			wantCostNonZero: false,
+		},
+		{
+			name:         "invalid expression with cost",
+			expression:   "1 +",
+			context:      map[string]interface{}{},
+			trackCost:    true,
+			wantErr:      true,
+		},
+		{
+			name:         "invalid expression without cost",
+			expression:   "1 +",
+			context:      map[string]interface{}{},
+			trackCost:    false,
+			wantErr:      true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			envOpts := []celhelpers.EnvOption{}
+			if tt.trackCost {
+				envOpts = append(envOpts, celhelpers.WithCostTracking())
+			}
+			env, _, err := celhelpers.DefaultEnvironment(envOpts...)
+			if err != nil {
+				t.Fatalf("celhelpers.DefaultEnvironment() error = %v", err)
+			}
+
+			gotValue, gotCost, err := evaluateExpression(env, tt.context, tt.expression, tt.trackCost)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("evaluateExpression() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr {
+				if !reflect.DeepEqual(gotValue, tt.wantValue) {
+					t.Errorf("evaluateExpression() gotValue = %v, want %v", gotValue, tt.wantValue)
+				}
+				if tt.trackCost {
+					if tt.wantCostNonZero && gotCost <= 0 {
+						t.Errorf("evaluateExpression() gotCost = %v, expected > 0 when trackCost is true", gotCost)
+					}
+					if !tt.wantCostNonZero && gotCost != 0 {
+						// This test assumes simple ops like `1+2` or `'hello'.size()` have non-zero cost.
+						// If CEL itself reports 0 for these, this assertion might need adjustment.
+						t.Logf("evaluateExpression() gotCost = %v, expected 0 if expression has zero cost inherently", gotCost)
+					}
+				} else { // if !tt.trackCost
+					if gotCost != 0 {
+						t.Errorf("evaluateExpression() gotCost = %v, want 0 when trackCost is false", gotCost)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestAggregateCELCosts(t *testing.T) {
+	resource1ID := "resource1"
+	resource2ID := "resource2"
+	instanceID := "instance"
+
+	tests := []struct {
+		name                string
+		trackCost           bool
+		runtimeVariables    map[string][]*expressionEvaluationState
+		expectedTotalCost   *int64
+		expectedCostPerRsrc map[string]int64
+		expectNilMetrics    bool
+	}{
+		{
+			name:             "trackCost false",
+			trackCost:        false,
+			runtimeVariables: map[string][]*expressionEvaluationState{},
+			expectNilMetrics: true,
+		},
+		{
+			name:             "trackCost true, no variables",
+			trackCost:        true,
+			runtimeVariables: map[string][]*expressionEvaluationState{},
+			expectNilMetrics: true,
+		},
+		{
+			name:      "trackCost true, variables present but no costs recorded (all zero or unresolved)",
+			trackCost: true,
+			runtimeVariables: map[string][]*expressionEvaluationState{
+				resource1ID: {
+					{Expression: "expr1", Dependencies: []string{}, Kind: variable.ResourceVariableKindStatic, Resolved: true, ResolvedValue: "val", Cost: 0},
+					{Expression: "exprUnresolved", Resolved: false, Cost: 200},
+				},
+			},
+			expectNilMetrics: true,
+		},
+		{
+			name:      "trackCost true, variables present with positive costs",
+			trackCost: true,
+			runtimeVariables: map[string][]*expressionEvaluationState{
+				resource1ID: {
+					{Expression: "expr1", Resolved: true, Cost: 100},
+					{Expression: "expr2", Resolved: true, Cost: 50},
+					{Expression: "exprUnresolved", Resolved: false, Cost: 200}, // Should be ignored
+				},
+				resource2ID: {
+					{Expression: "expr3", Resolved: true, Cost: 75},
+				},
+				instanceID: { // Simulating instance specific expressions
+					{Expression: "exprInstance", Resolved: true, Cost: 25},
+				},
+			},
+			expectedTotalCost: toInt64Ptr(100 + 50 + 75 + 25),
+			expectedCostPerRsrc: map[string]int64{
+				resource1ID: 150,
+				resource2ID: 75,
+				instanceID:  25,
+			},
+		},
+		{
+			name:      "trackCost true, only one resource with cost, others no cost",
+			trackCost: true,
+			runtimeVariables: map[string][]*expressionEvaluationState{
+				resource1ID: {
+					{Expression: "expr1", Resolved: true, Cost: 120},
+				},
+				resource2ID: { // No resolved costs for this resource
+					{Expression: "expr2", Resolved: true, Cost: 0},
+					{Expression: "exprUnresolved", Resolved: false, Cost: 300},
+				},
+			},
+			expectedTotalCost: toInt64Ptr(120),
+			expectedCostPerRsrc: map[string]int64{
+				resource1ID: 120,
+				// resource2ID should be omitted as its total cost is 0
+			},
+		},
+		{
+			name:      "trackCost true, all costs are zero",
+			trackCost: true,
+			runtimeVariables: map[string][]*expressionEvaluationState{
+				resource1ID: {
+					{Expression: "expr1", Resolved: true, Cost: 0},
+				},
+			},
+			expectNilMetrics: true, // As per implementation, if total cost is 0 and no per-resource cost > 0, returns nil
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rt := &ResourceGraphDefinitionRuntime{
+				trackCost:        tt.trackCost,
+				runtimeVariables: tt.runtimeVariables,
+				// Other fields (instance, resources, expressionsCache etc.) are not directly used by AggregateCELCosts
+			}
+
+			metrics, err := rt.AggregateCELCosts()
+			if err != nil {
+				t.Fatalf("AggregateCELCosts() unexpected error: %v", err)
+			}
+
+			if tt.expectNilMetrics {
+				if metrics != nil {
+					t.Errorf("Expected nil CELCostMetrics, but got %+v", metrics)
+				}
+				return // Test finished if nil metrics were expected
+			}
+
+			// If non-nil metrics are expected
+			if metrics == nil {
+				t.Fatalf("Expected non-nil CELCostMetrics, but got nil")
+			}
+
+			// Check TotalCost
+			if tt.expectedTotalCost == nil { // Expected total cost to be nil (e.g. if all costs were zero but something in costPerResource)
+				if metrics.TotalCost != nil {
+					t.Errorf("Expected metrics.TotalCost to be nil, got %d", *metrics.TotalCost)
+				}
+			} else { // Expected a specific total cost value
+				if metrics.TotalCost == nil {
+					t.Errorf("Expected metrics.TotalCost to be %d, got nil", *tt.expectedTotalCost)
+				} else if *metrics.TotalCost != *tt.expectedTotalCost {
+					t.Errorf("Expected TotalCost %d, got %d", *tt.expectedTotalCost, *metrics.TotalCost)
+				}
+			}
+
+			// Check CostPerResource
+			// Ensure reflect.DeepEqual handles nil vs empty map appropriately based on your logic.
+			// If CostPerResource can be nil or empty map and both are acceptable, adjust check.
+			if len(tt.expectedCostPerRsrc) == 0 && len(metrics.CostPerResource) == 0 {
+				// Both are empty or nil, which is fine.
+			} else if !reflect.DeepEqual(metrics.CostPerResource, tt.expectedCostPerRsrc) {
+				t.Errorf("Expected CostPerResource %+v, got %+v", tt.expectedCostPerRsrc, metrics.CostPerResource)
+			}
+		})
+	}
+}
+
+// toInt64Ptr is a helper function to get a pointer to an int64 value.
+func toInt64Ptr(val int64) *int64 {
+	return &val
+}
 
 func Test_RuntimeWorkflow(t *testing.T) {
 	// 1. Setup initial resources
@@ -219,7 +461,8 @@ func Test_RuntimeWorkflow(t *testing.T) {
 	}
 
 	// 2. Create runtime
-	rt, err := NewResourceGraphDefinitionRuntime(instance, resources, []string{"configmap", "secret", "deployment", "service"})
+	// Assuming trackCost is true for this existing workflow test.
+	rt, err := NewResourceGraphDefinitionRuntime(instance, resources, []string{"configmap", "secret", "deployment", "service"}, true)
 	if err != nil {
 		t.Fatalf("NewResourceGraphDefinitionRuntime() error = %v", err)
 	}
@@ -446,7 +689,8 @@ func Test_NewResourceGraphDefinitionRuntime(t *testing.T) {
 		"service":    service,
 	}
 
-	rt, err := NewResourceGraphDefinitionRuntime(instance, resources, []string{"deployment", "service"})
+	// Assuming trackCost is true for this existing test.
+	rt, err := NewResourceGraphDefinitionRuntime(instance, resources, []string{"deployment", "service"}, true)
 	if err != nil {
 		t.Fatalf("NewResourceGraphDefinitionRuntime() error = %v", err)
 	}
@@ -2476,15 +2720,23 @@ func Test_areDependenciesIgnored(t *testing.T) {
 	}
 }
 
-func setupTestEnv(names []string) (*cel.Env, error) {
-	return krocel.DefaultEnvironment(krocel.WithResourceIDs(names))
+func setupTestEnv(t *testing.T, names []string, trackCost bool) *cel.Env {
+	t.Helper()
+	envOpts := []celhelpers.EnvOption{celhelpers.WithResourceIDs(names)}
+	if trackCost {
+		envOpts = append(envOpts, celhelpers.WithCostTracking())
+	}
+	env, _, err := celhelpers.DefaultEnvironment(envOpts...)
+	if err != nil {
+		t.Fatalf("celhelpers.DefaultEnvironment() error = %v", err)
+	}
+	return env
 }
 
 func Test_evaluateExpression(t *testing.T) {
-	env, err := setupTestEnv([]string{"data"})
-	if err != nil {
-		t.Fatalf("failed to create environment: %v", err)
-	}
+	// This test is now superseded by TestEvaluateExpression_CostCalculation for cost aspects.
+	// We'll keep its original structure but ensure it calls evaluateExpression with trackCost: false.
+	env := setupTestEnv(t, []string{"data"}, false) // trackCost is false for original test logic
 
 	tests := []struct {
 		name       string
@@ -2525,13 +2777,18 @@ func Test_evaluateExpression(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := evaluateExpression(env, tt.context, tt.expression)
+			gotValue, gotCost, err := evaluateExpression(env, tt.context, tt.expression, false) // trackCost: false
 			if (err != nil) != tt.wantErr {
 				t.Errorf("evaluateExpression() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if err == nil && got != tt.want {
-				t.Errorf("evaluateExpression() = %v, want %v", got, tt.want)
+			if !tt.wantErr {
+				if !reflect.DeepEqual(gotValue, tt.want) {
+					t.Errorf("evaluateExpression() gotValue = %v, want %v", gotValue, tt.want)
+				}
+				if gotCost != 0 {
+					t.Errorf("evaluateExpression() gotCost = %v, want 0 for trackCost: false", gotCost)
+				}
 			}
 		})
 	}

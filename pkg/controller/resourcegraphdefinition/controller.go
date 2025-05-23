@@ -56,6 +56,7 @@ type ResourceGraphDefinitionReconciler struct {
 	rgBuilder               *graph.Builder
 	dynamicController       *dynamiccontroller.DynamicController
 	maxConcurrentReconciles int
+	trackCELCosts           bool // New field
 }
 
 func NewResourceGraphDefinitionReconciler(
@@ -75,6 +76,7 @@ func NewResourceGraphDefinitionReconciler(
 		metadataLabeler:         metadata.NewKROMetaLabeler(),
 		rgBuilder:               builder,
 		maxConcurrentReconciles: maxConcurrentReconciles,
+		trackCELCosts:           true, // Initialize the new field
 	}
 }
 
@@ -166,8 +168,8 @@ func (r *ResourceGraphDefinitionReconciler) Reconcile(ctx context.Context, o *v1
 		return ctrl.Result{}, err
 	}
 
-	topologicalOrder, resourcesInformation, reconcileErr := r.reconcileResourceGraphDefinition(ctx, o)
+	topologicalOrder, resourcesInformation, celMetrics, reconcileErr := r.reconcileResourceGraphDefinition(ctx, o)
 
 	return ctrl.Result{},
-		r.setResourceGraphDefinitionStatus(ctx, o, topologicalOrder, resourcesInformation, reconcileErr)
+		r.setResourceGraphDefinitionStatus(ctx, o, topologicalOrder, resourcesInformation, celMetrics, reconcileErr)
 }

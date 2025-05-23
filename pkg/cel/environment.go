@@ -33,6 +33,8 @@ type envOptions struct {
 	resourceIDs []string
 	// customDeclarations will be added to the CEL environment.
 	customDeclarations []cel.EnvOption
+	// TrackCost indicates whether CEL evaluation cost should be tracked.
+	TrackCost bool
 }
 
 // WithResourceIDs adds resource ids that will be declared as CEL variables.
@@ -49,8 +51,15 @@ func WithCustomDeclarations(declarations []cel.EnvOption) EnvOption {
 	}
 }
 
-// DefaultEnvironment returns the default CEL environment.
-func DefaultEnvironment(options ...EnvOption) (*cel.Env, error) {
+// WithCostTracking enables the tracking of CEL evaluation costs.
+func WithCostTracking() EnvOption {
+	return func(opts *envOptions) {
+		opts.TrackCost = true
+	}
+}
+
+// DefaultEnvironment returns the default CEL environment and the processed options.
+func DefaultEnvironment(options ...EnvOption) (*cel.Env, *envOptions, error) {
 	declarations := []cel.EnvOption{
 		ext.Lists(),
 		ext.Strings(),
@@ -68,5 +77,9 @@ func DefaultEnvironment(options ...EnvOption) (*cel.Env, error) {
 		declarations = append(declarations, cel.Variable(name, cel.AnyType))
 	}
 
-	return cel.NewEnv(declarations...)
+	env, err := cel.NewEnv(declarations...)
+	if err != nil {
+		return nil, nil, err
+	}
+	return env, opts, nil
 }

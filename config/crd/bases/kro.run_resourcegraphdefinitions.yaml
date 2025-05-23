@@ -316,6 +316,29 @@ spec:
                 items:
                   type: string
                 type: array
+              celMetrics:
+                description: Contains the cost metrics for CEL expression evaluations.
+                type: object
+                properties:
+                  totalCost:
+                    description: Estimated total cost of all CEL expressions evaluated.
+                    type: integer
+                    format: int64
+                  costPerResource:
+                    description: |-
+                      Breakdown of CEL evaluation costs per resource ID or component.
+                      Keys might be resource IDs or special identifiers like "_static",
+                      "_instance_status", "_includeWhen", "_readyWhen".
+                    type: object
+                    additionalProperties:
+                      type: integer
+                      format: int64
+                nullable: true # Indicates that celMetrics itself can be null or omitted.
+                               # Alternatively, make totalCost and costPerResource optional within celMetrics.
+                               # For consistency with how optional fields are usually handled (pointer to struct in Go),
+                               # making the parent `celMetrics` field nullable/optional is appropriate.
+                               # The individual fields `totalCost` and `costPerResource` are implicitly optional
+                               # if not listed in a `required` array for `celMetrics`.
             type: object
         type: object
     served: true
